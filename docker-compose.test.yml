@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["server", "--port", "9867", "--dir", "/workspace"]
+    command: ["server", "--foreground", "--port", "9867", "--dir", "/workspace"]
     volumes:
       - server-data:/workspace
     ports:

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -116,6 +117,7 @@ var (
 	flagFollow     bool
 	flagForeground bool
 	flagTarget     string
+	flagRestart    bool
 )
 
 func init() {
@@ -126,6 +128,7 @@ func init() {
 	clientCmd.Flags().StringVarP(&flagServer, "server", "s", "", "Server address (or OTA_SERVER env)")
 	clientCmd.Flags().StringVarP(&flagWorkDir, "dir", "d", ".", "Working directory")
 	clientCmd.Flags().StringVarP(&flagCommand, "cmd", "c", "", "Hot-reload command (or OTA_CMD env)")
+	clientCmd.Flags().BoolVarP(&flagRestart, "restart", "r", false, "Restart cmd on file sync (for non-hot-reload tools)")
 
 	logsCmd.Flags().BoolVarP(&flagFollow, "follow", "f", false, "Follow log output")
 
@@ -166,49 +169,46 @@ func startDaemon() error {
 	if err != nil {
 		return err
 	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return err
+	}
 
 	absDir, err := filepath.Abs(flagWorkDir)
 	if err != nil {
 		return err
 	}
 
-	args := []string{"server", "--foreground", "--port", strconv.Itoa(flagPort), "--dir", absDir}
+	cmd := exec.Command(exe, "server", "--foreground", "--port", strconv.Itoa(flagPort), "--dir", absDir)
+	cmd.Dir = absDir
+	cmd.Env = os.Environ()
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
-	devNull, err := os.Open(os.DevNull)
-	if err != nil {
-		return err
-	}
-	defer devNull.Close()
-
-	attr := &os.ProcAttr{
-		Dir:   absDir,
-		Env:   os.Environ(),
-		Files: []*os.File{devNull, devNull, devNull},
-		Sys:   &syscall.SysProcAttr{Setsid: true},
-	}
-
-	proc, err := os.StartProcess(exe, append([]string{exe}, args...), attr)
-	if err != nil {
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 
-	proc.Release()
-	fmt.Printf("Server started (PID: %d), logs: %s\n", proc.Pid, config.ServerLogFile())
+	pid := cmd.Process.Pid
+	cmd.Process.Release()
+	fmt.Printf("Server started (PID: %d), logs: %s\n", pid, config.ServerLogFile())
 	return nil
 }
 
 func runServerStop(cmd *cobra.Command, args []string) error {
-	return signalServer(syscall.SIGTERM, "stop")
+	return signalServer(syscall.SIGTERM, "stopped")
 }
 
 func runServerRestart(cmd *cobra.Command, args []string) error {
-	signalServer(syscall.SIGTERM, "stop")
+	signalServer(syscall.SIGTERM, "stopped")
 	time.Sleep(1 * time.Second)
 	return startDaemon()
 }
 
 func runServerKill(cmd *cobra.Command, args []string) error {
-	return signalServer(syscall.SIGKILL, "kill")
+	return signalServer(syscall.SIGKILL, "killed")
 }
 
 func signalServer(sig syscall.Signal, action string) error {
@@ -229,7 +229,7 @@ func signalServer(sig syscall.Signal, action string) error {
 	}
 
 	config.RemovePid(config.ServerPidFile())
-	fmt.Printf("Server %sed (PID: %d)\n", action, pid)
+	fmt.Printf("Server %s (PID: %d)\n", action, pid)
 	return nil
 }
 
@@ -253,7 +253,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 		command = os.Getenv("OTA_CMD")
 	}
 
-	c := client.New(serverURL, flagWorkDir, command)
+	c := client.New(serverURL, flagWorkDir, command, flagRestart)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -411,7 +411,7 @@ func runDisconnect(cmd *cobra.Command, args []string) error {
 	target := args[0]
 	switch target {
 	case "server":
-		return signalServer(syscall.SIGTERM, "disconnect")
+		return signalServer(syscall.SIGTERM, "disconnected")
 	case "client":
 		pid, err := config.LoadPid(config.ClientPidFile())
 		if err != nil {

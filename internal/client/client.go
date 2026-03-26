@@ -19,30 +19,33 @@ import (
 )
 
 type Client struct {
-	serverURL string
-	workDir   string
-	command   string
-	clientID  string
-	hostname  string
-	conn      *websocket.Conn
-	proc      *process.Manager
-	stopCh    chan struct{}
-	syncDone  bool
+	serverURL     string
+	workDir       string
+	command       string
+	clientID      string
+	hostname      string
+	conn          *websocket.Conn
+	proc          *process.Manager
+	stopCh        chan struct{}
+	syncDone      bool
+	restartOnSync bool
+	restartTimer  *time.Timer
 }
 
-func New(serverURL, workDir, command string) *Client {
+func New(serverURL, workDir, command string, restartOnSync bool) *Client {
 	hostname, _ := os.Hostname()
 	absDir, _ := filepath.Abs(workDir)
 
 	id := fmt.Sprintf("%s-%s-%d", hostname, filepath.Base(absDir), os.Getpid())
 
 	return &Client{
-		serverURL: serverURL,
-		workDir:   absDir,
-		command:   command,
-		clientID:  id,
-		hostname:  hostname,
-		stopCh:    make(chan struct{}),
+		serverURL:     serverURL,
+		workDir:       absDir,
+		command:       command,
+		clientID:      id,
+		hostname:      hostname,
+		stopCh:        make(chan struct{}),
+		restartOnSync: restartOnSync,
 	}
 }
 
@@ -190,6 +193,7 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 			logger.Log.Error().Err(err).Str("path", change.Path).Msg("failed to apply change")
 		} else {
 			logger.Log.Info().Str("path", change.Path).Msg("file updated")
+			c.scheduleRestart()
 		}
 
 	case protocol.MsgFileDelete:
@@ -201,6 +205,7 @@ func (c *Client) handleMessage(msg *protocol.Message) {
 			logger.Log.Error().Err(err).Str("path", del.Path).Msg("failed to delete file")
 		} else {
 			logger.Log.Info().Str("path", del.Path).Msg("file deleted")
+			c.scheduleRestart()
 		}
 
 	case protocol.MsgSyncDone:
@@ -263,6 +268,21 @@ func (c *Client) startCommand() {
 	if err := c.proc.Start(); err != nil {
 		logger.Log.Error().Err(err).Str("command", c.command).Msg("failed to start command")
 	}
+}
+
+func (c *Client) scheduleRestart() {
+	if !c.restartOnSync || c.proc == nil || c.command == "" {
+		return
+	}
+	if c.restartTimer != nil {
+		c.restartTimer.Stop()
+	}
+	c.restartTimer = time.AfterFunc(500*time.Millisecond, func() {
+		logger.Log.Info().Msg("restarting command after sync")
+		if err := c.proc.Restart(); err != nil {
+			logger.Log.Error().Err(err).Msg("failed to restart command")
+		}
+	})
 }
 
 func (c *Client) handleExec(req *protocol.ExecRequest) {
