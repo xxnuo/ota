@@ -62,6 +62,7 @@ func (s *Server) StartAndGetPort() (int, error) {
 	mux.HandleFunc("/stop", s.handleControl(protocol.MsgStop, "stop"))
 	mux.HandleFunc("/kill", s.handleControl(protocol.MsgKill, "kill"))
 	mux.HandleFunc("/restart", s.handleControl(protocol.MsgRestart, "restart"))
+	mux.HandleFunc("/exec", s.handleExec)
 	mux.HandleFunc("/ps", s.handlePs)
 
 	addr := fmt.Sprintf(":%d", s.port)
@@ -314,6 +315,40 @@ func (s *Server) handleControl(msgType protocol.MsgType, action string) http.Han
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "%s sent to client %s\n", action, cc.label())
 	}
+}
+
+func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cc, err := s.getClient(r.URL.Query().Get("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	cmdStr := r.URL.Query().Get("cmd")
+	if cmdStr == "" {
+		http.Error(w, "cmd parameter required", http.StatusBadRequest)
+		return
+	}
+
+	payload := &protocol.ExecPayload{Cmd: cmdStr}
+	data, _ := protocol.NewMsg(protocol.MsgExec, payload)
+	cc.mu.Lock()
+	err = cc.conn.WriteMessage(websocket.TextMessage, data)
+	cc.mu.Unlock()
+
+	if err != nil {
+		http.Error(w, "send failed", http.StatusInternalServerError)
+		return
+	}
+
+	clog.Server("exec %q sent to client %s", cmdStr, cc.label())
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "exec %q sent to client %s\n", cmdStr, cc.label())
 }
 
 func (s *Server) handlePs(w http.ResponseWriter, r *http.Request) {

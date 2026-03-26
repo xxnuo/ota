@@ -15,6 +15,7 @@ const (
 	MsgStop       MsgType = "stop"
 	MsgKill       MsgType = "kill"
 	MsgRestart    MsgType = "restart"
+	MsgExec       MsgType = "exec"
 	MsgPing       MsgType = "ping"
 	MsgPong       MsgType = "pong"
 )
@@ -38,6 +39,10 @@ type LogPayload struct {
 
 type HelloPayload struct {
 	ID string `json:"id"`
+}
+
+type ExecPayload struct {
+	Cmd string `json:"cmd"`
 }
 
 func NewMsg(t MsgType, payload interface{}) ([]byte, error) {

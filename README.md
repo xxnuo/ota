@@ -82,7 +82,16 @@ ota kill                # force kill (SIGKILL)
 ota restart             # stop + restart the last sent binary
 ```
 
-### 5. Disconnect
+### 5. Execute a Command
+
+```bash
+ota exec ls -la
+ota exec "cat /etc/os-release"
+```
+
+The command runs on the client via `sh -c`, with stdout/stderr streamed back.
+
+### 6. Disconnect
 
 ```bash
 ota disconnect
@@ -100,6 +109,7 @@ The client will stop the running app and exit.
 | `ota stop` | Graceful stop the running app (SIGTERM) |
 | `ota kill` | Force kill the running app (SIGKILL) |
 | `ota restart` | Stop and restart the last sent binary |
+| `ota exec <command>` | Execute a shell command on the client |
 | `ota disconnect` | Disconnect client and make it exit |
 
 ## Directory-Based Port File
@@ -189,6 +199,7 @@ Communication uses WebSocket with JSON messages:
 | `stop` | server → client | Graceful stop the running app |
 | `kill` | server → client | Force kill the running app |
 | `restart` | server → client | Stop + restart the last sent binary |
+| `exec` | server → client | Execute a shell command on the client |
 | `disconnect` | server → client | Tell client to exit |
 | `ping/pong` | bidirectional | Keepalive |
 

@@ -84,7 +84,16 @@ ota kill                # 强制杀死（SIGKILL）
 ota restart             # 停止 + 重启上次发送的二进制
 ```
 
-### 5. 断开连接
+### 5. 远程执行命令
+
+```bash
+ota exec ls -la
+ota exec "cat /etc/os-release"
+```
+
+命令通过 `sh -c` 在 Client 端执行，stdout/stderr 实时回传。
+
+### 6. 断开连接
 
 ```bash
 ota disconnect
@@ -102,6 +111,7 @@ Client 会停止正在运行的 app 并退出。
 | `ota stop` | 优雅停止运行中的程序（SIGTERM） |
 | `ota kill` | 强制杀死运行中的程序（SIGKILL） |
 | `ota restart` | 停止并重启上次发送的二进制 |
+| `ota exec <command>` | 在 Client 端执行 shell 命令 |
 | `ota disconnect` | 断开 Client 连接并使其退出 |
 
 ## 基于目录的端口文件
@@ -175,6 +185,7 @@ make v3           # 编译 v3 并发送
 | `stop` | server → client | 优雅停止运行中的程序 |
 | `kill` | server → client | 强制杀死运行中的程序 |
 | `restart` | server → client | 停止并重启上次发送的二进制 |
+| `exec` | server → client | 在 Client 端执行 shell 命令 |
 | `disconnect` | server → client | 通知 Client 退出 |
 | `ping/pong` | 双向 | 心跳保活 |
 

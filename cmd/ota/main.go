@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -67,6 +68,13 @@ var restartCmd = &cobra.Command{
 	RunE:  runControlCmd("restart"),
 }
 
+var execCmd = &cobra.Command{
+	Use:   "exec <command>",
+	Short: "Execute a command on the client",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runExec,
+}
+
 var psCmd = &cobra.Command{
 	Use:   "ps",
 	Short: "List connected clients",
@@ -93,12 +101,12 @@ func init() {
 	sendCmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
 	sendCmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
 
-	for _, cmd := range []*cobra.Command{disconnectCmd, stopCmd, killCmd, restartCmd} {
+	for _, cmd := range []*cobra.Command{disconnectCmd, stopCmd, killCmd, restartCmd, execCmd} {
 		cmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
 		cmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
 	}
 
-	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, stopCmd, killCmd, restartCmd, psCmd)
+	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, stopCmd, killCmd, restartCmd, execCmd, psCmd)
 }
 
 func main() {
@@ -290,4 +298,30 @@ func runControlCmd(action string) func(*cobra.Command, []string) error {
 		fmt.Print(string(body))
 		return nil
 	}
+}
+
+func runExec(cmd *cobra.Command, args []string) error {
+	port, err := loadPort()
+	if err != nil {
+		return err
+	}
+
+	cmdStr := strings.Join(args, " ")
+	reqURL := fmt.Sprintf("http://localhost:%d/exec?cmd=%s", port, url.QueryEscape(cmdStr))
+	if id := resolveID(); id != "" {
+		reqURL += "&id=" + id
+	}
+	resp, err := http.Post(reqURL, "", nil)
+	if err != nil {
+		return fmt.Errorf("exec failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server: %s", strings.TrimSpace(string(body)))
+	}
+
+	fmt.Print(string(body))
+	return nil
 }

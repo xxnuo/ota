@@ -1,10 +1,12 @@
 package client
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -128,6 +130,14 @@ func (c *Client) connectAndRun() error {
 			c.sendLog("client", "restart requested")
 			c.restartApp()
 
+		case protocol.MsgExec:
+			payload, err := protocol.Parse[protocol.ExecPayload](&msg)
+			if err != nil {
+				c.sendLog("client", fmt.Sprintf("parse exec msg error: %v", err))
+				continue
+			}
+			go c.handleExec(payload.Cmd)
+
 		case protocol.MsgDisconnect:
 			c.stopApp()
 			return errDisconnected
@@ -200,6 +210,45 @@ func (c *Client) killApp() {
 func (c *Client) restartApp() {
 	c.stopApp()
 	c.startProc()
+}
+
+func (c *Client) handleExec(cmdStr string) {
+	c.sendLog("exec", fmt.Sprintf("$ %s", cmdStr))
+	cmd := exec.Command("sh", "-c", cmdStr)
+	cmd.Dir = c.workDir
+
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		c.sendLog("exec", fmt.Sprintf("start error: %v", err))
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			c.sendLog("exec", scanner.Text())
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			c.sendLog("exec:err", scanner.Text())
+		}
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
+
+	if err := cmd.Wait(); err != nil {
+		c.sendLog("exec", fmt.Sprintf("exit: %v", err))
+	} else {
+		c.sendLog("exec", "exit: 0")
+	}
 }
 
 func (c *Client) sendLog(source, line string) {
