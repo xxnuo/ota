@@ -1,0 +1,48 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["server", "--port", "9867", "--dir", "/workspace"]
+    volumes:
+      - server-data:/workspace
+    ports:
+      - "9867:9867"
+    networks:
+      - ota-net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9867/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["client", "--server", "ws://server:9867", "--dir", "/workspace", "--cmd", "echo sync-complete"]
+    volumes:
+      - client-data:/workspace
+    networks:
+      - ota-net
+    depends_on:
+      server:
+        condition: service_healthy
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    networks:
+      - ota-net
+    depends_on:
+      server:
+        condition: service_healthy
+
+volumes:
+  server-data:
+  client-data:
+
+networks:
+  ota-net:
+    driver: bridge
