@@ -7,8 +7,8 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,10 +20,26 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+type clientConn struct {
+	id   int
+	name string
+	conn *websocket.Conn
+	addr string
+	mu   sync.Mutex
+}
+
+func (c *clientConn) label() string {
+	if c.name != "" {
+		return fmt.Sprintf("#%d(%s)", c.id, c.name)
+	}
+	return fmt.Sprintf("#%d", c.id)
+}
+
 type Server struct {
 	port     int
-	conn     *websocket.Conn
-	mu       sync.Mutex
+	clients  map[int]*clientConn
+	nextID   int
+	mu       sync.RWMutex
 	listener net.Listener
 	httpSrv  *http.Server
 	done     chan struct{}
@@ -31,8 +47,10 @@ type Server struct {
 
 func New(port int) *Server {
 	return &Server{
-		port: port,
-		done: make(chan struct{}),
+		port:    port,
+		clients: make(map[int]*clientConn),
+		nextID:  1,
+		done:    make(chan struct{}),
 	}
 }
 
@@ -41,6 +59,7 @@ func (s *Server) StartAndGetPort() (int, error) {
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/send", s.handleSend)
 	mux.HandleFunc("/disconnect", s.handleDisconnect)
+	mux.HandleFunc("/ps", s.handlePs)
 
 	addr := fmt.Sprintf(":%d", s.port)
 	ln, err := net.Listen("tcp", addr)
@@ -70,19 +89,17 @@ func (s *Server) Serve() error {
 	return err
 }
 
-func (s *Server) Port() int {
-	return s.port
-}
-
 func (s *Server) Stop() {
 	s.mu.Lock()
-	if s.conn != nil {
+	for _, c := range s.clients {
 		msg, _ := protocol.NewMsg(protocol.MsgDisconnect, nil)
-		s.conn.WriteMessage(websocket.TextMessage, msg)
-		time.Sleep(200 * time.Millisecond)
-		s.conn.Close()
-		s.conn = nil
+		c.mu.Lock()
+		c.conn.WriteMessage(websocket.TextMessage, msg)
+		c.mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		c.conn.Close()
 	}
+	s.clients = make(map[int]*clientConn)
 	s.mu.Unlock()
 	close(s.done)
 }
@@ -95,29 +112,27 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if s.conn != nil {
-		s.conn.Close()
-	}
-	s.conn = conn
+	id := s.nextID
+	s.nextID++
+	cc := &clientConn{id: id, conn: conn, addr: conn.RemoteAddr().String()}
+	s.clients[id] = cc
 	s.mu.Unlock()
 
-	log.Printf("[server] client connected: %s", conn.RemoteAddr())
+	log.Printf("[server] client #%d connected: %s", id, conn.RemoteAddr())
 
 	defer func() {
 		s.mu.Lock()
-		if s.conn == conn {
-			s.conn = nil
-		}
+		delete(s.clients, id)
 		s.mu.Unlock()
 		conn.Close()
-		log.Printf("[server] client disconnected: %s", conn.RemoteAddr())
+		log.Printf("[server] client #%d disconnected: %s", id, cc.addr)
 	}()
 
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("[server] read error: %v", err)
+				log.Printf("[server] client #%d read error: %v", id, err)
 			}
 			return
 		}
@@ -128,16 +143,67 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch msg.Type {
+		case protocol.MsgHello:
+			hello, err := protocol.Parse[protocol.HelloPayload](&msg)
+			if err == nil && hello.ID != "" {
+				cc.mu.Lock()
+				cc.name = hello.ID
+				cc.mu.Unlock()
+				log.Printf("[server] client %s identified", cc.label())
+			}
+
 		case protocol.MsgLog:
 			payload, err := protocol.Parse[protocol.LogPayload](&msg)
 			if err != nil {
 				continue
 			}
-			fmt.Printf("[%s] %s\n", payload.Source, payload.Line)
+			if s.clientCount() > 1 {
+				fmt.Printf("[%s %s] %s\n", cc.label(), payload.Source, payload.Line)
+			} else {
+				fmt.Printf("[%s] %s\n", payload.Source, payload.Line)
+			}
 
 		case protocol.MsgPong:
 		}
 	}
+}
+
+func (s *Server) clientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.clients)
+}
+
+func (s *Server) getClient(idStr string) (*clientConn, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.clients) == 0 {
+		return nil, fmt.Errorf("no client connected")
+	}
+
+	if idStr == "" || idStr == "0" {
+		if len(s.clients) == 1 {
+			for _, c := range s.clients {
+				return c, nil
+			}
+		}
+		return nil, fmt.Errorf("multiple clients connected, specify --id or --name (use 'ota ps' to list)")
+	}
+
+	if id, err := strconv.Atoi(idStr); err == nil {
+		if c, ok := s.clients[id]; ok {
+			return c, nil
+		}
+		return nil, fmt.Errorf("client #%d not found", id)
+	}
+
+	for _, c := range s.clients {
+		if c.name == idStr {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("client '%s' not found", idStr)
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -146,12 +212,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
-
-	if conn == nil {
-		http.Error(w, "no client connected", http.StatusServiceUnavailable)
+	cc, err := s.getClient(r.URL.Query().Get("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -179,18 +242,18 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	err = conn.WriteMessage(websocket.TextMessage, data)
-	s.mu.Unlock()
+	cc.mu.Lock()
+	err = cc.conn.WriteMessage(websocket.TextMessage, data)
+	cc.mu.Unlock()
 
 	if err != nil {
 		http.Error(w, "send failed", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[server] sent %s (%d bytes) to client", filename, len(content))
+	log.Printf("[server] sent %s (%d bytes) to client #%d", filename, len(content), cc.id)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "sent %s (%d bytes)\n", filename, len(content))
+	fmt.Fprintf(w, "sent %s (%d bytes) to #%d\n", filename, len(content), cc.id)
 }
 
 func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
@@ -199,61 +262,39 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
-
-	if conn == nil {
-		http.Error(w, "no client connected", http.StatusServiceUnavailable)
+	cc, err := s.getClient(r.URL.Query().Get("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	data, _ := protocol.NewMsg(protocol.MsgDisconnect, nil)
-	s.mu.Lock()
-	conn.WriteMessage(websocket.TextMessage, data)
+	cc.mu.Lock()
+	cc.conn.WriteMessage(websocket.TextMessage, data)
+	cc.mu.Unlock()
 	time.Sleep(200 * time.Millisecond)
-	conn.Close()
-	s.conn = nil
+	cc.conn.Close()
+
+	s.mu.Lock()
+	delete(s.clients, cc.id)
 	s.mu.Unlock()
 
-	log.Printf("[server] client disconnected by request")
+	log.Printf("[server] client %s disconnected by request", cc.label())
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "disconnected")
+	fmt.Fprintf(w, "client %s disconnected\n", cc.label())
 }
 
-func (s *Server) SendFile(filePath string, args string) error {
-	s.mu.Lock()
-	conn := s.conn
-	s.mu.Unlock()
+func (s *Server) handlePs(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	if conn == nil {
-		return fmt.Errorf("no client connected")
+	if len(s.clients) == 0 {
+		fmt.Fprintln(w, "no clients connected")
+		return
 	}
 
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("read file: %w", err)
+	fmt.Fprintf(w, "clients: %d\n", len(s.clients))
+	for _, c := range s.clients {
+		fmt.Fprintf(w, "  %-12s %s\n", c.label(), c.addr)
 	}
-
-	payload := &protocol.BinaryPayload{
-		Filename: filepath.Base(filePath),
-		Content:  content,
-		Args:     args,
-	}
-
-	data, err := protocol.NewMsg(protocol.MsgBinary, payload)
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	err = conn.WriteMessage(websocket.TextMessage, data)
-	s.mu.Unlock()
-
-	if err != nil {
-		return fmt.Errorf("send failed: %w", err)
-	}
-
-	log.Printf("[server] sent %s (%d bytes)", filepath.Base(filePath), len(content))
-	return nil
 }

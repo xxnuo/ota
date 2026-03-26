@@ -5,6 +5,10 @@ services:
     ports:
       - "9867:9867"
 
-  client:
+  client1:
     build: .
-    command: ["client", "-s", "ws://server:9867", "-d", "/workspace"]
+    command: ["client", "-s", "ws://server:9867", "-d", "/workspace", "--id", "dev1"]
+
+  client2:
+    build: .
+    command: ["client", "-s", "ws://server:9867", "-d", "/workspace", "--id", "dev2"]

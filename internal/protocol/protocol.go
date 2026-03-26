@@ -10,6 +10,7 @@ type MsgType string
 const (
 	MsgBinary     MsgType = "binary"
 	MsgLog        MsgType = "log"
+	MsgHello      MsgType = "hello"
 	MsgDisconnect MsgType = "disconnect"
 	MsgPing       MsgType = "ping"
 	MsgPong       MsgType = "pong"
@@ -30,6 +31,10 @@ type BinaryPayload struct {
 type LogPayload struct {
 	Source string `json:"src"`
 	Line   string `json:"line"`
+}
+
+type HelloPayload struct {
+	ID string `json:"id"`
 }
 
 func NewMsg(t MsgType, payload interface{}) ([]byte, error) {

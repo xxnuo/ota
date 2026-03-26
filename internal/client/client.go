@@ -18,16 +18,18 @@ import (
 type Client struct {
 	serverURL string
 	workDir   string
+	id        string
 	conn      *websocket.Conn
 	proc      *process.Manager
 	done      chan struct{}
 }
 
-func New(serverURL, workDir string) *Client {
+func New(serverURL, workDir, id string) *Client {
 	absDir, _ := filepath.Abs(workDir)
 	return &Client{
 		serverURL: serverURL,
 		workDir:   absDir,
+		id:        id,
 		done:      make(chan struct{}),
 	}
 }
@@ -80,6 +82,12 @@ func (c *Client) connectAndRun() error {
 	}
 	c.conn = conn
 	log.Printf("[client] connected to %s", c.serverURL)
+
+	if c.id != "" {
+		hello, _ := protocol.NewMsg(protocol.MsgHello, &protocol.HelloPayload{ID: c.id})
+		conn.WriteMessage(websocket.TextMessage, hello)
+	}
+
 	c.sendLog("client", "connected")
 
 	defer func() {

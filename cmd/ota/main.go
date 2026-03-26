@@ -45,8 +45,14 @@ var sendCmd = &cobra.Command{
 
 var disconnectCmd = &cobra.Command{
 	Use:   "disconnect",
-	Short: "Disconnect the client",
+	Short: "Disconnect a client",
 	RunE:  runDisconnect,
+}
+
+var psCmd = &cobra.Command{
+	Use:   "ps",
+	Short: "List connected clients",
+	RunE:  runPs,
 }
 
 var (
@@ -54,6 +60,7 @@ var (
 	flagServer string
 	flagDir    string
 	flagArgs   string
+	flagID     string
 )
 
 func init() {
@@ -61,10 +68,17 @@ func init() {
 
 	clientCmd.Flags().StringVarP(&flagServer, "server", "s", "", "Server address (or OTA_SERVER env)")
 	clientCmd.Flags().StringVarP(&flagDir, "dir", "d", ".", "Working directory")
+	clientCmd.Flags().StringVar(&flagID, "id", "", "Client identifier (or OTA_ID env)")
+	clientCmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
 
 	sendCmd.Flags().StringVar(&flagArgs, "args", "", "Arguments for the binary")
+	sendCmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
+	sendCmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
 
-	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd)
+	disconnectCmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
+	disconnectCmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
+
+	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, psCmd)
 }
 
 func main() {
@@ -85,9 +99,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 		srv.Stop()
 	}()
 
-	port, startErr := srv.StartAndGetPort()
-	if startErr != nil && port == 0 {
-		return startErr
+	port, err := srv.StartAndGetPort()
+	if err != nil {
+		return err
 	}
 
 	os.WriteFile(portFile, []byte(strconv.Itoa(port)), 0644)
@@ -109,7 +123,12 @@ func runClient(cmd *cobra.Command, args []string) error {
 		serverURL = "ws://" + serverURL
 	}
 
-	c := client.New(serverURL, flagDir)
+	id := flagID
+	if id == "" {
+		id = os.Getenv("OTA_ID")
+	}
+
+	c := client.New(serverURL, flagDir, id)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -133,6 +152,16 @@ func loadPort() (int, error) {
 	return port, nil
 }
 
+func resolveID() string {
+	if flagID != "" {
+		return flagID
+	}
+	if env := os.Getenv("OTA_ID"); env != "" {
+		return env
+	}
+	return ""
+}
+
 func runSend(cmd *cobra.Command, args []string) error {
 	port, err := loadPort()
 	if err != nil {
@@ -151,12 +180,15 @@ func runSend(cmd *cobra.Command, args []string) error {
 	}
 
 	filename := filepath.Base(absPath)
-	url := fmt.Sprintf("http://localhost:%d/send?filename=%s", port, filename)
+	reqURL := fmt.Sprintf("http://localhost:%d/send?filename=%s", port, filename)
+	if id := resolveID(); id != "" {
+		reqURL += "&id=" + id
+	}
 	if flagArgs != "" {
-		url += "&args=" + flagArgs
+		reqURL += "&args=" + flagArgs
 	}
 
-	resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(content))
+	resp, err := http.Post(reqURL, "application/octet-stream", bytes.NewReader(content))
 	if err != nil {
 		return fmt.Errorf("send failed (server on port %d): %w", port, err)
 	}
@@ -164,7 +196,7 @@ func runSend(cmd *cobra.Command, args []string) error {
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server error: %s", string(body))
+		return fmt.Errorf("server: %s", strings.TrimSpace(string(body)))
 	}
 
 	fmt.Print(string(body))
@@ -177,8 +209,11 @@ func runDisconnect(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	url := fmt.Sprintf("http://localhost:%d/disconnect", port)
-	resp, err := http.Post(url, "", nil)
+	reqURL := fmt.Sprintf("http://localhost:%d/disconnect", port)
+	if id := resolveID(); id != "" {
+		reqURL += "?id=" + id
+	}
+	resp, err := http.Post(reqURL, "", nil)
 	if err != nil {
 		return fmt.Errorf("disconnect failed: %w", err)
 	}
@@ -186,9 +221,26 @@ func runDisconnect(cmd *cobra.Command, args []string) error {
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server error: %s", string(body))
+		return fmt.Errorf("server: %s", strings.TrimSpace(string(body)))
 	}
 
+	fmt.Print(string(body))
+	return nil
+}
+
+func runPs(cmd *cobra.Command, args []string) error {
+	port, err := loadPort()
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/ps", port))
+	if err != nil {
+		return fmt.Errorf("ps failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
 	fmt.Print(string(body))
 	return nil
 }
