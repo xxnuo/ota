@@ -1,0 +1,10 @@
+services:
+  server:
+    build: .
+    command: ["server", "-p", "9867"]
+    ports:
+      - "9867:9867"
+
+  client:
+    build: .
+    command: ["client", "-s", "ws://server:9867", "-d", "/workspace"]

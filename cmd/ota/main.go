@@ -1,142 +1,70 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/xxnuo/ota/internal/client"
-	"github.com/xxnuo/ota/internal/config"
-	"github.com/xxnuo/ota/internal/logger"
 	"github.com/xxnuo/ota/internal/server"
 )
 
+const portFile = ".ota"
+
 var rootCmd = &cobra.Command{
 	Use:   "ota",
-	Short: "OTA - Over The Air code sync & hot reload",
+	Short: "OTA - push binary to remote and run",
 }
 
 var serverCmd = &cobra.Command{
 	Use:   "server",
-	Short: "Start server daemon",
+	Short: "Start server (foreground)",
 	RunE:  runServer,
-}
-
-var serverStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop server",
-	RunE:  runServerStop,
-}
-
-var serverRestartCmd = &cobra.Command{
-	Use:   "restart",
-	Short: "Restart server",
-	RunE:  runServerRestart,
-}
-
-var serverKillCmd = &cobra.Command{
-	Use:   "kill",
-	Short: "Force kill server",
-	RunE:  runServerKill,
 }
 
 var clientCmd = &cobra.Command{
 	Use:   "client",
-	Short: "Start client and connect to server",
+	Short: "Connect to server and wait for binaries",
 	RunE:  runClient,
 }
 
-var cmdCmd = &cobra.Command{
-	Use:   "cmd",
-	Short: "Manage the hot-reload command",
-}
-
-var cmdStartCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start the command",
-	RunE:  runCmdAction("start"),
-}
-
-var cmdStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop the command",
-	RunE:  runCmdAction("stop"),
-}
-
-var cmdKillCmd = &cobra.Command{
-	Use:   "kill",
-	Short: "Kill the command",
-	RunE:  runCmdAction("kill"),
-}
-
-var cmdRestartCmd = &cobra.Command{
-	Use:   "restart",
-	Short: "Restart the command",
-	RunE:  runCmdAction("restart"),
-}
-
-var logsCmd = &cobra.Command{
-	Use:   "logs",
-	Short: "View logs",
-	RunE:  runLogs,
-}
-
-var execCmd = &cobra.Command{
-	Use:   "exec [command]",
-	Short: "Execute command on remote client",
-	Args:  cobra.MinimumNArgs(1),
-	RunE:  runExec,
-}
-
-var psCmd = &cobra.Command{
-	Use:   "ps",
-	Short: "Show connection info",
-	RunE:  runPs,
+var sendCmd = &cobra.Command{
+	Use:   "send <file>",
+	Short: "Send binary to connected client",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runSend,
 }
 
 var disconnectCmd = &cobra.Command{
-	Use:   "disconnect [server|client]",
-	Short: "Disconnect a connection",
-	Args:  cobra.ExactArgs(1),
+	Use:   "disconnect",
+	Short: "Disconnect the client",
 	RunE:  runDisconnect,
 }
 
 var (
-	flagPort       int
-	flagWorkDir    string
-	flagServer     string
-	flagCommand    string
-	flagFollow     bool
-	flagForeground bool
-	flagTarget     string
-	flagRestart    bool
+	flagPort   int
+	flagServer string
+	flagDir    string
+	flagArgs   string
 )
 
 func init() {
-	serverCmd.Flags().IntVarP(&flagPort, "port", "p", 9867, "Server port")
-	serverCmd.Flags().StringVarP(&flagWorkDir, "dir", "d", ".", "Working directory")
-	serverCmd.Flags().BoolVar(&flagForeground, "foreground", false, "Run in foreground (default: daemon)")
+	serverCmd.Flags().IntVarP(&flagPort, "port", "p", 0, "Server port (0 = auto)")
 
 	clientCmd.Flags().StringVarP(&flagServer, "server", "s", "", "Server address (or OTA_SERVER env)")
-	clientCmd.Flags().StringVarP(&flagWorkDir, "dir", "d", ".", "Working directory")
-	clientCmd.Flags().StringVarP(&flagCommand, "cmd", "c", "", "Hot-reload command (or OTA_CMD env)")
-	clientCmd.Flags().BoolVarP(&flagRestart, "restart", "r", false, "Restart cmd on file sync (for non-hot-reload tools)")
+	clientCmd.Flags().StringVarP(&flagDir, "dir", "d", ".", "Working directory")
 
-	logsCmd.Flags().BoolVarP(&flagFollow, "follow", "f", false, "Follow log output")
+	sendCmd.Flags().StringVar(&flagArgs, "args", "", "Arguments for the binary")
 
-	execCmd.Flags().StringVarP(&flagTarget, "target", "t", "", "Target client workDir")
-
-	serverCmd.AddCommand(serverStopCmd, serverRestartCmd, serverKillCmd)
-	cmdCmd.AddCommand(cmdStartCmd, cmdStopCmd, cmdKillCmd, cmdRestartCmd)
-	rootCmd.AddCommand(serverCmd, clientCmd, cmdCmd, logsCmd, execCmd, psCmd, disconnectCmd)
+	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd)
 }
 
 func main() {
@@ -146,96 +74,29 @@ func main() {
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
-	if !flagForeground {
-		return startDaemon()
-	}
-
-	logger.InitSilent("server")
-
-	srv := server.New(flagWorkDir, flagPort)
+	srv := server.New(flagPort)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		fmt.Println()
+		os.Remove(portFile)
 		srv.Stop()
 	}()
 
-	return srv.Start()
-}
-
-func startDaemon() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return err
+	port, startErr := srv.StartAndGetPort()
+	if startErr != nil && port == 0 {
+		return startErr
 	}
 
-	absDir, err := filepath.Abs(flagWorkDir)
-	if err != nil {
-		return err
-	}
+	os.WriteFile(portFile, []byte(strconv.Itoa(port)), 0644)
+	defer os.Remove(portFile)
 
-	cmd := exec.Command(exe, "server", "--foreground", "--port", strconv.Itoa(flagPort), "--dir", absDir)
-	cmd.Dir = absDir
-	cmd.Env = os.Environ()
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start daemon: %w", err)
-	}
-
-	pid := cmd.Process.Pid
-	cmd.Process.Release()
-	fmt.Printf("Server started (PID: %d), logs: %s\n", pid, config.ServerLogFile())
-	return nil
-}
-
-func runServerStop(cmd *cobra.Command, args []string) error {
-	return signalServer(syscall.SIGTERM, "stopped")
-}
-
-func runServerRestart(cmd *cobra.Command, args []string) error {
-	signalServer(syscall.SIGTERM, "stopped")
-	time.Sleep(1 * time.Second)
-	return startDaemon()
-}
-
-func runServerKill(cmd *cobra.Command, args []string) error {
-	return signalServer(syscall.SIGKILL, "killed")
-}
-
-func signalServer(sig syscall.Signal, action string) error {
-	pid, err := config.LoadPid(config.ServerPidFile())
-	if err != nil {
-		return fmt.Errorf("server not running (no pid file)")
-	}
-
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		config.RemovePid(config.ServerPidFile())
-		return fmt.Errorf("server process not found")
-	}
-
-	if err := proc.Signal(sig); err != nil {
-		config.RemovePid(config.ServerPidFile())
-		return fmt.Errorf("failed to %s server: %w", action, err)
-	}
-
-	config.RemovePid(config.ServerPidFile())
-	fmt.Printf("Server %s (PID: %d)\n", action, pid)
-	return nil
+	return srv.Serve()
 }
 
 func runClient(cmd *cobra.Command, args []string) error {
-	logger.Init("client")
-
 	serverURL := flagServer
 	if serverURL == "" {
 		serverURL = os.Getenv("OTA_SERVER")
@@ -248,12 +109,7 @@ func runClient(cmd *cobra.Command, args []string) error {
 		serverURL = "ws://" + serverURL
 	}
 
-	command := flagCommand
-	if command == "" {
-		command = os.Getenv("OTA_CMD")
-	}
-
-	c := client.New(serverURL, flagWorkDir, command, flagRestart)
+	c := client.New(serverURL, flagDir)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -265,167 +121,74 @@ func runClient(cmd *cobra.Command, args []string) error {
 	return c.Start()
 }
 
-func runCmdAction(action string) func(*cobra.Command, []string) error {
-	return func(cmd *cobra.Command, args []string) error {
-		pid, err := config.LoadPid(config.ClientPidFile())
-		if err != nil {
-			return fmt.Errorf("client not running")
-		}
-
-		var sig syscall.Signal
-		switch action {
-		case "start":
-			sig = syscall.SIGUSR1
-		case "stop":
-			sig = syscall.SIGUSR2
-		case "kill":
-			sig = syscall.SIGURG
-		case "restart":
-			sig = syscall.SIGHUP
-		}
-
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			return fmt.Errorf("client process not found")
-		}
-
-		if err := proc.Signal(sig); err != nil {
-			return fmt.Errorf("failed to send signal: %w", err)
-		}
-
-		fmt.Printf("Command %s signal sent to client (PID: %d)\n", action, pid)
-		return nil
+func loadPort() (int, error) {
+	data, err := os.ReadFile(portFile)
+	if err != nil {
+		return 0, fmt.Errorf("no server running in this directory (missing %s file)", portFile)
 	}
+	port, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("invalid port in %s", portFile)
+	}
+	return port, nil
 }
 
-func runLogs(cmd *cobra.Command, args []string) error {
-	logFiles := []string{config.ServerLogFile(), config.ClientLogFile()}
-	var activeFile string
-	for _, f := range logFiles {
-		if _, err := os.Stat(f); err == nil {
-			activeFile = f
-			break
-		}
-	}
-	if activeFile == "" {
-		return fmt.Errorf("no log files found")
-	}
-
-	if flagFollow {
-		return tailFollow(activeFile)
-	}
-
-	data, err := os.ReadFile(activeFile)
+func runSend(cmd *cobra.Command, args []string) error {
+	port, err := loadPort()
 	if err != nil {
 		return err
 	}
-	fmt.Print(string(data))
-	return nil
-}
 
-func tailFollow(path string) error {
-	f, err := os.Open(path)
+	filePath := args[0]
+	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	f.Seek(0, 2)
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	scanner := bufio.NewScanner(f)
-	for {
-		select {
-		case <-sigCh:
-			return nil
-		default:
-			if scanner.Scan() {
-				fmt.Println(scanner.Text())
-			} else {
-				time.Sleep(100 * time.Millisecond)
-				scanner = bufio.NewScanner(f)
-			}
-		}
-	}
-}
-
-func runExec(cmd *cobra.Command, args []string) error {
-	command := strings.Join(args, " ")
-
-	cfg, err := config.LoadServerConfig()
+	content, err := os.ReadFile(absPath)
 	if err != nil {
-		return fmt.Errorf("server config not found, ensure server is running")
+		return fmt.Errorf("read file: %w", err)
 	}
 
-	fmt.Printf("Sending exec to server at %s: %s\n", cfg.Address, command)
-	fmt.Printf("Target workDir: %s\n", flagTarget)
-	fmt.Println("(exec forwarding requires active server process - use ota server to start)")
+	filename := filepath.Base(absPath)
+	url := fmt.Sprintf("http://localhost:%d/send?filename=%s", port, filename)
+	if flagArgs != "" {
+		url += "&args=" + flagArgs
+	}
 
-	return nil
-}
-
-func runPs(cmd *cobra.Command, args []string) error {
-	fmt.Println("=== Server Info ===")
-	cfg, err := config.LoadServerConfig()
+	resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(content))
 	if err != nil {
-		fmt.Println("  Server: not running")
-	} else {
-		pid, _ := config.LoadPid(config.ServerPidFile())
-		fmt.Printf("  PID:     %d\n", pid)
-		fmt.Printf("  Address: %s\n", cfg.Address)
-		fmt.Printf("  WorkDir: %s\n", cfg.WorkDir)
+		return fmt.Errorf("send failed (server on port %d): %w", port, err)
+	}
+	defer resp.Body.Close()
 
-		state, err := config.LoadServerState()
-		if err == nil {
-			clients := state.GetClients()
-			if len(clients) > 0 {
-				fmt.Printf("  Clients: %d\n", len(clients))
-				for _, c := range clients {
-					fmt.Printf("    - ID: %s, Host: %s, WorkDir: %s, Addr: %s\n", c.ID, c.Hostname, c.WorkDir, c.Addr)
-				}
-			} else {
-				fmt.Println("  Clients: none")
-			}
-		}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server error: %s", string(body))
 	}
 
-	fmt.Println()
-	fmt.Println("=== Client Info ===")
-	ccfg, err := config.LoadClientConfig()
-	if err != nil {
-		fmt.Println("  Client: not running")
-	} else {
-		pid, _ := config.LoadPid(config.ClientPidFile())
-		fmt.Printf("  PID:     %d\n", pid)
-		fmt.Printf("  Server:  %s\n", ccfg.ServerURL)
-		fmt.Printf("  WorkDir: %s\n", ccfg.WorkDir)
-		fmt.Printf("  Command: %s\n", ccfg.Command)
-	}
-
+	fmt.Print(string(body))
 	return nil
 }
 
 func runDisconnect(cmd *cobra.Command, args []string) error {
-	target := args[0]
-	switch target {
-	case "server":
-		return signalServer(syscall.SIGTERM, "disconnected")
-	case "client":
-		pid, err := config.LoadPid(config.ClientPidFile())
-		if err != nil {
-			return fmt.Errorf("client not running")
-		}
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			return fmt.Errorf("client process not found")
-		}
-		proc.Signal(syscall.SIGTERM)
-		config.RemovePid(config.ClientPidFile())
-		fmt.Printf("Client disconnected (PID: %d)\n", pid)
-		return nil
-	default:
-		return fmt.Errorf("unknown target: %s (use 'server' or 'client')", target)
+	port, err := loadPort()
+	if err != nil {
+		return err
 	}
+
+	url := fmt.Sprintf("http://localhost:%d/disconnect", port)
+	resp, err := http.Post(url, "", nil)
+	if err != nil {
+		return fmt.Errorf("disconnect failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server error: %s", string(body))
+	}
+
+	fmt.Print(string(body))
+	return nil
 }
