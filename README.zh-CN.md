@@ -12,8 +12,10 @@
 │                             │          │                          │
 │  ota server (前台运行)       │◄════════►│  ota client              │
 │    ├─ HTTP  /send           │ WebSocket│    ├─ 接收二进制          │
-│    ├─ HTTP  /disconnect     │          │    ├─ 停止旧进程          │
-│    └─ WS   /ws              │          │    ├─ 启动新进程          │
+│    ├─ HTTP  /stop,kill      │          │    ├─ 停止旧进程          │
+│    ├─ HTTP  /restart        │          │    ├─ 启动新进程          │
+│    ├─ HTTP  /disconnect     │          │    │                     │
+│    └─ WS   /ws              │          │    │                     │
 │                             │          │    └─ 回传日志            │
 │  ota send ./build/app ──────┼──►       │                          │
 │                             │          │                          │
@@ -74,7 +76,15 @@ Client 收到后会：
 3. 启动新二进制
 4. 将所有 stdout/stderr 实时回传到 Server 前台
 
-### 4. 断开连接
+### 4. 控制运行中的程序
+
+```bash
+ota stop                # 优雅停止（SIGTERM，500ms 后 SIGKILL）
+ota kill                # 强制杀死（SIGKILL）
+ota restart             # 停止 + 重启上次发送的二进制
+```
+
+### 5. 断开连接
 
 ```bash
 ota disconnect
@@ -89,6 +99,9 @@ Client 会停止正在运行的 app 并退出。
 | `ota server [-p PORT]` | 前台启动服务器（0 = 自动端口） |
 | `ota client -s URL [-d DIR]` | 连接服务器，等待接收二进制 |
 | `ota send <file> [--args "..."]` | 发送二进制到已连接的 Client |
+| `ota stop` | 优雅停止运行中的程序（SIGTERM） |
+| `ota kill` | 强制杀死运行中的程序（SIGKILL） |
+| `ota restart` | 停止并重启上次发送的二进制 |
 | `ota disconnect` | 断开 Client 连接并使其退出 |
 
 ## 基于目录的端口文件
@@ -159,6 +172,9 @@ make v3           # 编译 v3 并发送
 |---------|------|------|
 | `binary` | server → client | 二进制文件传输（文件名 + 内容 + 参数） |
 | `log` | client → server | 日志行（来源 + 内容） |
+| `stop` | server → client | 优雅停止运行中的程序 |
+| `kill` | server → client | 强制杀死运行中的程序 |
+| `restart` | server → client | 停止并重启上次发送的二进制 |
 | `disconnect` | server → client | 通知 Client 退出 |
 | `ping/pong` | 双向 | 心跳保活 |
 

@@ -3,7 +3,6 @@ package client
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/xxnuo/ota/internal/clog"
 	"github.com/xxnuo/ota/internal/process"
 	"github.com/xxnuo/ota/internal/protocol"
 )
@@ -21,6 +21,7 @@ type Client struct {
 	id        string
 	conn      *websocket.Conn
 	proc      *process.Manager
+	lastBin   *protocol.BinaryPayload
 	done      chan struct{}
 }
 
@@ -36,7 +37,7 @@ func New(serverURL, workDir, id string) *Client {
 
 func (c *Client) Start() error {
 	os.MkdirAll(c.workDir, 0755)
-	log.Printf("[client] workDir: %s", c.workDir)
+	clog.Client("workDir: %s", c.workDir)
 
 	for {
 		select {
@@ -47,7 +48,7 @@ func (c *Client) Start() error {
 
 		err := c.connectAndRun()
 		if err == errDisconnected {
-			log.Printf("[client] disconnected by server, exiting")
+			clog.Client("disconnected by server, exiting")
 			return nil
 		}
 
@@ -55,7 +56,7 @@ func (c *Client) Start() error {
 		case <-c.done:
 			return nil
 		default:
-			log.Printf("[client] connection lost, reconnecting in 3s...")
+			clog.Client("connection lost, reconnecting in 3s...")
 			time.Sleep(3 * time.Second)
 		}
 	}
@@ -77,11 +78,11 @@ func (c *Client) connectAndRun() error {
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		log.Printf("[client] connect failed: %v", err)
+		clog.Error("connect failed: %v", err)
 		return err
 	}
 	c.conn = conn
-	log.Printf("[client] connected to %s", c.serverURL)
+	clog.Client("connected to %s", c.serverURL)
 
 	if c.id != "" {
 		hello, _ := protocol.NewMsg(protocol.MsgHello, &protocol.HelloPayload{ID: c.id})
@@ -115,6 +116,18 @@ func (c *Client) connectAndRun() error {
 			}
 			c.handleBinary(payload)
 
+		case protocol.MsgStop:
+			c.sendLog("client", "stop requested")
+			c.stopApp()
+
+		case protocol.MsgKill:
+			c.sendLog("client", "kill requested")
+			c.killApp()
+
+		case protocol.MsgRestart:
+			c.sendLog("client", "restart requested")
+			c.restartApp()
+
 		case protocol.MsgDisconnect:
 			c.stopApp()
 			return errDisconnected
@@ -135,11 +148,27 @@ func (c *Client) handleBinary(payload *protocol.BinaryPayload) {
 		return
 	}
 
+	c.lastBin = &protocol.BinaryPayload{
+		Filename: payload.Filename,
+		Args:     payload.Args,
+	}
+
 	c.sendLog("client", fmt.Sprintf("received %s (%d bytes)", payload.Filename, len(payload.Content)))
 
+	c.startProc()
+}
+
+func (c *Client) startProc() {
+	if c.lastBin == nil {
+		c.sendLog("client", "no binary to start")
+		return
+	}
+
+	binPath := filepath.Join(c.workDir, c.lastBin.Filename)
+
 	var args []string
-	if payload.Args != "" {
-		args = strings.Fields(payload.Args)
+	if c.lastBin.Args != "" {
+		args = strings.Fields(c.lastBin.Args)
 	}
 
 	c.proc = process.New(binPath, args, c.workDir, c.sendLog)
@@ -147,7 +176,7 @@ func (c *Client) handleBinary(payload *protocol.BinaryPayload) {
 		c.sendLog("client", fmt.Sprintf("start app error: %v", err))
 		return
 	}
-	c.sendLog("client", fmt.Sprintf("started %s", payload.Filename))
+	c.sendLog("client", fmt.Sprintf("started %s", c.lastBin.Filename))
 }
 
 func (c *Client) stopApp() {
@@ -161,8 +190,20 @@ func (c *Client) stopApp() {
 	}
 }
 
+func (c *Client) killApp() {
+	if c.proc != nil && c.proc.IsRunning() {
+		c.proc.Kill()
+		c.sendLog("client", "app killed")
+	}
+}
+
+func (c *Client) restartApp() {
+	c.stopApp()
+	c.startProc()
+}
+
 func (c *Client) sendLog(source, line string) {
-	log.Printf("[%s] %s", source, line)
+	clog.App(source, line)
 	if c.conn == nil {
 		return
 	}

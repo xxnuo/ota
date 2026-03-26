@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/xxnuo/ota/internal/clog"
 	"github.com/xxnuo/ota/internal/protocol"
 )
 
@@ -59,6 +59,9 @@ func (s *Server) StartAndGetPort() (int, error) {
 	mux.HandleFunc("/ws", s.handleWS)
 	mux.HandleFunc("/send", s.handleSend)
 	mux.HandleFunc("/disconnect", s.handleDisconnect)
+	mux.HandleFunc("/stop", s.handleControl(protocol.MsgStop, "stop"))
+	mux.HandleFunc("/kill", s.handleControl(protocol.MsgKill, "kill"))
+	mux.HandleFunc("/restart", s.handleControl(protocol.MsgRestart, "restart"))
 	mux.HandleFunc("/ps", s.handlePs)
 
 	addr := fmt.Sprintf(":%d", s.port)
@@ -77,7 +80,7 @@ func (s *Server) StartAndGetPort() (int, error) {
 		s.httpSrv.Close()
 	}()
 
-	log.Printf("[server] listening on :%d", actualPort)
+	clog.Server("listening on :%d", actualPort)
 	return actualPort, nil
 }
 
@@ -107,7 +110,7 @@ func (s *Server) Stop() {
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[server] ws upgrade failed: %v", err)
+		clog.Error("ws upgrade failed: %v", err)
 		return
 	}
 
@@ -118,21 +121,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.clients[id] = cc
 	s.mu.Unlock()
 
-	log.Printf("[server] client #%d connected: %s", id, conn.RemoteAddr())
+	clog.Server("client #%d connected: %s", id, conn.RemoteAddr())
 
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, id)
 		s.mu.Unlock()
 		conn.Close()
-		log.Printf("[server] client #%d disconnected: %s", id, cc.addr)
+		clog.Server("client #%d disconnected: %s", id, cc.addr)
 	}()
 
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("[server] client #%d read error: %v", id, err)
+				clog.Error("client #%d read error: %v", id, err)
 			}
 			return
 		}
@@ -149,7 +152,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				cc.mu.Lock()
 				cc.name = hello.ID
 				cc.mu.Unlock()
-				log.Printf("[server] client %s identified", cc.label())
+				clog.Server("client %s identified", cc.label())
 			}
 
 		case protocol.MsgLog:
@@ -158,9 +161,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if s.clientCount() > 1 {
-				fmt.Printf("[%s %s] %s\n", cc.label(), payload.Source, payload.Line)
+				clog.Remote(cc.label(), payload.Source, payload.Line)
 			} else {
-				fmt.Printf("[%s] %s\n", payload.Source, payload.Line)
+				clog.RemoteSimple(payload.Source, payload.Line)
 			}
 
 		case protocol.MsgPong:
@@ -251,7 +254,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[server] sent %s (%d bytes) to client #%d", filename, len(content), cc.id)
+	clog.Server("sent %s (%d bytes) to client #%d", filename, len(content), cc.id)
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "sent %s (%d bytes) to #%d\n", filename, len(content), cc.id)
 }
@@ -279,9 +282,38 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	delete(s.clients, cc.id)
 	s.mu.Unlock()
 
-	log.Printf("[server] client %s disconnected by request", cc.label())
+	clog.Server("client %s disconnected by request", cc.label())
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "client %s disconnected\n", cc.label())
+}
+
+func (s *Server) handleControl(msgType protocol.MsgType, action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+
+		cc, err := s.getClient(r.URL.Query().Get("id"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		data, _ := protocol.NewMsg(msgType, nil)
+		cc.mu.Lock()
+		err = cc.conn.WriteMessage(websocket.TextMessage, data)
+		cc.mu.Unlock()
+
+		if err != nil {
+			http.Error(w, "send failed", http.StatusInternalServerError)
+			return
+		}
+
+		clog.Server("%s sent to client %s", action, cc.label())
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "%s sent to client %s\n", action, cc.label())
+	}
 }
 
 func (s *Server) handlePs(w http.ResponseWriter, r *http.Request) {

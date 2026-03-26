@@ -49,6 +49,24 @@ var disconnectCmd = &cobra.Command{
 	RunE:  runDisconnect,
 }
 
+var stopCmd = &cobra.Command{
+	Use:   "stop",
+	Short: "Stop the running app (SIGTERM)",
+	RunE:  runControlCmd("stop"),
+}
+
+var killCmd = &cobra.Command{
+	Use:   "kill",
+	Short: "Kill the running app (SIGKILL)",
+	RunE:  runControlCmd("kill"),
+}
+
+var restartCmd = &cobra.Command{
+	Use:   "restart",
+	Short: "Restart the running app",
+	RunE:  runControlCmd("restart"),
+}
+
 var psCmd = &cobra.Command{
 	Use:   "ps",
 	Short: "List connected clients",
@@ -75,10 +93,12 @@ func init() {
 	sendCmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
 	sendCmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
 
-	disconnectCmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
-	disconnectCmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
+	for _, cmd := range []*cobra.Command{disconnectCmd, stopCmd, killCmd, restartCmd} {
+		cmd.Flags().StringVar(&flagID, "id", "", "Target client (or OTA_ID env)")
+		cmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
+	}
 
-	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, psCmd)
+	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, stopCmd, killCmd, restartCmd, psCmd)
 }
 
 func main() {
@@ -243,4 +263,31 @@ func runPs(cmd *cobra.Command, args []string) error {
 	body, _ := io.ReadAll(resp.Body)
 	fmt.Print(string(body))
 	return nil
+}
+
+func runControlCmd(action string) func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		port, err := loadPort()
+		if err != nil {
+			return err
+		}
+
+		reqURL := fmt.Sprintf("http://localhost:%d/%s", port, action)
+		if id := resolveID(); id != "" {
+			reqURL += "?id=" + id
+		}
+		resp, err := http.Post(reqURL, "", nil)
+		if err != nil {
+			return fmt.Errorf("%s failed: %w", action, err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("server: %s", strings.TrimSpace(string(body)))
+		}
+
+		fmt.Print(string(body))
+		return nil
+	}
 }

@@ -12,6 +12,9 @@ const (
 	MsgLog        MsgType = "log"
 	MsgHello      MsgType = "hello"
 	MsgDisconnect MsgType = "disconnect"
+	MsgStop       MsgType = "stop"
+	MsgKill       MsgType = "kill"
+	MsgRestart    MsgType = "restart"
 	MsgPing       MsgType = "ping"
 	MsgPong       MsgType = "pong"
 )

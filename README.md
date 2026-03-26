@@ -12,8 +12,10 @@ Push binaries to remote machines and run them instantly. Built for rapid edit-co
 │                             │          │                          │
 │  ota server (foreground)    │◄════════►│  ota client              │
 │    ├─ HTTP  /send           │ WebSocket│    ├─ receives binary    │
-│    ├─ HTTP  /disconnect     │          │    ├─ stops old process  │
-│    └─ WS   /ws              │          │    ├─ starts new process │
+│    ├─ HTTP  /stop,kill      │          │    ├─ stops old process  │
+│    ├─ HTTP  /restart        │          │    ├─ starts new process │
+│    ├─ HTTP  /disconnect     │          │    │                     │
+│    └─ WS   /ws              │          │    │                     │
 │                             │          │    └─ streams logs back  │
 │  ota send ./build/app ──────┼──►       │                          │
 │                             │          │                          │
@@ -72,7 +74,15 @@ The client will:
 3. Start the new binary
 4. Stream all stdout/stderr back to the server
 
-### 4. Disconnect
+### 4. Control the Running App
+
+```bash
+ota stop                # graceful stop (SIGTERM, then SIGKILL after 500ms)
+ota kill                # force kill (SIGKILL)
+ota restart             # stop + restart the last sent binary
+```
+
+### 5. Disconnect
 
 ```bash
 ota disconnect
@@ -87,6 +97,9 @@ The client will stop the running app and exit.
 | `ota server [-p PORT]` | Start server in foreground (0 = auto port) |
 | `ota client -s URL [-d DIR]` | Connect to server and wait for binaries |
 | `ota send <file> [--args "..."]` | Send binary to the connected client |
+| `ota stop` | Graceful stop the running app (SIGTERM) |
+| `ota kill` | Force kill the running app (SIGKILL) |
+| `ota restart` | Stop and restart the last sent binary |
 | `ota disconnect` | Disconnect client and make it exit |
 
 ## Directory-Based Port File
@@ -173,6 +186,9 @@ Communication uses WebSocket with JSON messages:
 |---------|-----------|---------|
 | `binary` | server → client | Binary file transfer (filename + content + args) |
 | `log` | client → server | Log line (source + text) |
+| `stop` | server → client | Graceful stop the running app |
+| `kill` | server → client | Force kill the running app |
+| `restart` | server → client | Stop + restart the last sent binary |
 | `disconnect` | server → client | Tell client to exit |
 | `ping/pong` | bidirectional | Keepalive |
 
