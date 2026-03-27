@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 )
 
 type Manager struct {
@@ -40,7 +39,7 @@ func (m *Manager) Start() error {
 	m.cmd = exec.Command(m.binPath, m.args...)
 	m.cmd.Dir = m.workDir
 	m.cmd.Env = os.Environ()
-	m.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setSysProcAttr(m.cmd)
 
 	stdout, _ := m.cmd.StdoutPipe()
 	stderr, _ := m.cmd.StderrPipe()
@@ -92,12 +91,7 @@ func (m *Manager) Stop() {
 		return
 	}
 
-	pgid, err := syscall.Getpgid(m.cmd.Process.Pid)
-	if err == nil {
-		syscall.Kill(-pgid, syscall.SIGTERM)
-	} else {
-		m.cmd.Process.Signal(syscall.SIGTERM)
-	}
+	stopProcess(m.cmd.Process)
 	m.running = false
 }
 
@@ -109,12 +103,7 @@ func (m *Manager) Kill() {
 		return
 	}
 
-	pgid, err := syscall.Getpgid(m.cmd.Process.Pid)
-	if err == nil {
-		syscall.Kill(-pgid, syscall.SIGKILL)
-	} else {
-		m.cmd.Process.Kill()
-	}
+	killProcess(m.cmd.Process)
 	m.running = false
 }
 

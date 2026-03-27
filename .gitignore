@@ -26,3 +26,4 @@ go.work.sum
 /build
 demo/demo
 .ota
+ota
