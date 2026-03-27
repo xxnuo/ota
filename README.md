@@ -99,6 +99,17 @@ ota disconnect
 
 The client will stop the running app and exit.
 
+### 7. Watch Directory for Source Changes
+
+```bash
+ota watch -d ./src -c "make build && ota send ./build/app"
+```
+
+The `watch` command uses efficient `fsnotify` file system events to monitor a directory recursively. When a file changes, it runs the specified command. It automatically skips hidden folders and common directories like `node_modules` or `vendor`.
+
+- `--ext`: Watch specific extensions (e.g. `go,js`)
+- `--debounce`: Debounce interval in milliseconds (default: 500)
+
 ## Commands
 
 | Command | Description |
@@ -111,6 +122,7 @@ The client will stop the running app and exit.
 | `ota restart` | Stop and restart the last sent binary |
 | `ota exec <command>` | Execute a shell command on the client |
 | `ota disconnect` | Disconnect client and make it exit |
+| `ota watch -c CMD [-d DIR]` | Watch directory recursively and run command on change |
 
 ## Directory-Based Port File
 

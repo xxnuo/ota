@@ -101,6 +101,17 @@ ota disconnect
 
 Client 会停止正在运行的 app 并退出。
 
+### 7. 监听源码变化并执行
+
+```bash
+ota watch -d ./src -c "make build && ota send ./build/app"
+```
+
+`watch` 命令利用底层文件系统事件 (`fsnotify`) 递归监听目录，当代码发生变化时自动执行指定命令。自带去抖动控制（Debounce），自动忽略 `.git`、`node_modules` 等无关目录。完全零开销，极大地简化了热更流程。
+
+- `--ext`: 仅监听特定后缀（如 `go,js`）
+- `--debounce`: 防抖时间，单位毫秒 (默认: 500)
+
 ## 命令一览
 
 | 命令 | 说明 |
@@ -113,6 +124,7 @@ Client 会停止正在运行的 app 并退出。
 | `ota restart` | 停止并重启上次发送的二进制 |
 | `ota exec <command>` | 在 Client 端执行 shell 命令 |
 | `ota disconnect` | 断开 Client 连接并使其退出 |
+| `ota watch -c CMD [-d DIR]` | 递归监控目录文件变化并执行命令 |
 
 ## 基于目录的端口文件
 
