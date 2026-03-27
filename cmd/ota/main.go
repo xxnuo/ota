@@ -7,14 +7,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
 	"github.com/xxnuo/ota/internal/client"
+	"github.com/xxnuo/ota/internal/clog"
 	"github.com/xxnuo/ota/internal/server"
 )
 
@@ -81,12 +85,22 @@ var psCmd = &cobra.Command{
 	RunE:  runPs,
 }
 
+var watchCmd = &cobra.Command{
+	Use:   "watch",
+	Short: "Watch directory for source changes and run command",
+	RunE:  runWatch,
+}
+
 var (
-	flagPort   int
-	flagServer string
-	flagDir    string
-	flagArgs   string
-	flagID     string
+	flagPort     int
+	flagServer   string
+	flagDir      string
+	flagArgs     string
+	flagID       string
+	flagWatchDir  string
+	flagWatchCmd  string
+	flagDebounce  int
+	flagExts      string
 )
 
 func init() {
@@ -106,7 +120,13 @@ func init() {
 		cmd.Flags().StringVar(&flagID, "name", "", "Alias for --id")
 	}
 
-	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, stopCmd, killCmd, restartCmd, execCmd, psCmd)
+	watchCmd.Flags().StringVarP(&flagWatchDir, "dir", "d", ".", "Directory to watch")
+	watchCmd.Flags().StringVarP(&flagWatchCmd, "cmd", "c", "", "Command to run on change (required)")
+	watchCmd.Flags().IntVarP(&flagDebounce, "debounce", "i", 500, "Debounce interval in milliseconds")
+	watchCmd.Flags().StringVar(&flagExts, "ext", "", "File extensions to watch, comma separated (e.g. go,js,py). Empty = all files")
+	watchCmd.MarkFlagRequired("cmd")
+
+	rootCmd.AddCommand(serverCmd, clientCmd, sendCmd, disconnectCmd, stopCmd, killCmd, restartCmd, execCmd, psCmd, watchCmd)
 }
 
 func main() {
@@ -324,4 +344,120 @@ func runExec(cmd *cobra.Command, args []string) error {
 
 	fmt.Print(string(body))
 	return nil
+}
+
+var skipDirs = map[string]bool{
+	"node_modules": true, "vendor": true, "__pycache__": true,
+	".git": true, ".hg": true, ".svn": true,
+}
+
+func runWatch(cmd *cobra.Command, args []string) error {
+	dir, err := filepath.Abs(flagWatchDir)
+	if err != nil {
+		return err
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("invalid directory: %s", dir)
+	}
+
+	var extSet map[string]bool
+	if flagExts != "" {
+		extSet = make(map[string]bool)
+		for _, e := range strings.Split(flagExts, ",") {
+			e = strings.TrimSpace(e)
+			if e != "" {
+				if !strings.HasPrefix(e, ".") {
+					e = "." + e
+				}
+				extSet[e] = true
+			}
+		}
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("create watcher: %w", err)
+	}
+	defer watcher.Close()
+
+	watchDirRecursive(watcher, dir)
+
+	debounce := time.Duration(flagDebounce) * time.Millisecond
+	if debounce < 100*time.Millisecond {
+		debounce = 100 * time.Millisecond
+	}
+
+	clog.Info("watching %s (debounce %s, cmd: %s)", dir, debounce, flagWatchCmd)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	var timer *time.Timer
+
+	for {
+		select {
+		case <-sigCh:
+			clog.Info("stopped")
+			return nil
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
+				continue
+			}
+			name := filepath.Base(event.Name)
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			if extSet != nil && !extSet[filepath.Ext(name)] {
+				continue
+			}
+			if event.Op&fsnotify.Create != 0 {
+				if fi, err := os.Stat(event.Name); err == nil && fi.IsDir() {
+					watchDirRecursive(watcher, event.Name)
+				}
+			}
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.AfterFunc(debounce, func() {
+				clog.Info("change detected, running: %s", flagWatchCmd)
+				execWatch(flagWatchCmd)
+			})
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			clog.Error("watcher: %v", err)
+		}
+	}
+}
+
+func watchDirRecursive(watcher *fsnotify.Watcher, root string) {
+	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		name := info.Name()
+		if skipDirs[name] || (strings.HasPrefix(name, ".") && path != root) {
+			return filepath.SkipDir
+		}
+		watcher.Add(path)
+		return nil
+	})
+}
+
+func execWatch(cmdStr string) {
+	c := exec.Command("sh", "-c", cmdStr)
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		clog.Error("command failed: %v", err)
+	}
 }
