@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -18,14 +19,25 @@ import (
 )
 
 type Client struct {
-	serverURL string
-	workDir   string
-	id        string
-	conn      *websocket.Conn
-	proc      *process.Manager
-	lastBin   *protocol.BinaryPayload
-	done      chan struct{}
+	serverURL       string
+	workDir         string
+	id              string
+	mu              sync.Mutex
+	procMu          sync.Mutex
+	conn            *websocket.Conn
+	proc            *process.Manager
+	lastBin         *protocol.BinaryPayload
+	restartQueued   bool
+	suppressRestart bool
+	done            chan struct{}
 }
+
+var reconnectDelay = 3 * time.Second
+var stopTimeout = 500 * time.Millisecond
+var killTimeout = 2 * time.Second
+var crashRestartDelay = time.Second
+var fileBusyRetryDelay = 300 * time.Millisecond
+var fileBusyRetryCount = 10
 
 func New(serverURL, workDir, id string) *Client {
 	absDir, _ := filepath.Abs(workDir)
@@ -58,8 +70,8 @@ func (c *Client) Start() error {
 		case <-c.done:
 			return nil
 		default:
-			clog.Client("connection lost, reconnecting in 3s...")
-			time.Sleep(3 * time.Second)
+			clog.Client("connection lost, reconnecting in %s...", reconnectDelay)
+			time.Sleep(reconnectDelay)
 		}
 	}
 }
@@ -150,66 +162,93 @@ func (c *Client) connectAndRun() error {
 }
 
 func (c *Client) handleBinary(payload *protocol.BinaryPayload) {
-	c.stopApp()
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+
+	c.stopAppLocked()
 
 	binPath := filepath.Join(c.workDir, payload.Filename)
-	if err := os.WriteFile(binPath, payload.Content, 0755); err != nil {
+	if err := c.retryFileBusy("write binary", func() error {
+		return os.WriteFile(binPath, payload.Content, 0755)
+	}); err != nil {
 		c.sendLog("client", fmt.Sprintf("write binary error: %v", err))
 		return
 	}
 
+	c.mu.Lock()
 	c.lastBin = &protocol.BinaryPayload{
 		Filename: payload.Filename,
 		Args:     payload.Args,
 	}
+	c.restartQueued = false
+	c.suppressRestart = false
+	c.mu.Unlock()
 
 	c.sendLog("client", fmt.Sprintf("received %s (%d bytes)", payload.Filename, len(payload.Content)))
 
-	c.startProc()
+	c.startProcLocked()
 }
 
 func (c *Client) startProc() {
-	if c.lastBin == nil {
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.startProcLocked()
+}
+
+func (c *Client) startProcLocked() {
+	payload := c.currentBinary()
+	if payload == nil {
 		c.sendLog("client", "no binary to start")
 		return
 	}
 
-	binPath := filepath.Join(c.workDir, c.lastBin.Filename)
+	binPath := filepath.Join(c.workDir, payload.Filename)
 
 	var args []string
-	if c.lastBin.Args != "" {
-		args = strings.Fields(c.lastBin.Args)
+	if payload.Args != "" {
+		args = strings.Fields(payload.Args)
 	}
 
-	c.proc = process.New(binPath, args, c.workDir, c.sendLog)
-	if err := c.proc.Start(); err != nil {
+	var proc *process.Manager
+	proc = process.New(binPath, args, c.workDir, c.sendLog, func(state *os.ProcessState) {
+		c.handleProcExit(proc, state)
+	})
+
+	c.mu.Lock()
+	c.proc = proc
+	c.restartQueued = false
+	c.suppressRestart = false
+	c.mu.Unlock()
+
+	if err := c.retryFileBusy("start app", proc.Start); err != nil {
+		c.mu.Lock()
+		if c.proc == proc {
+			c.proc = nil
+		}
+		c.mu.Unlock()
 		c.sendLog("client", fmt.Sprintf("start app error: %v", err))
 		return
 	}
-	c.sendLog("client", fmt.Sprintf("started %s", c.lastBin.Filename))
+	c.sendLog("client", fmt.Sprintf("started %s", payload.Filename))
 }
 
 func (c *Client) stopApp() {
-	if c.proc != nil && c.proc.IsRunning() {
-		c.sendLog("client", "stopping app...")
-		c.proc.Stop()
-		time.Sleep(500 * time.Millisecond)
-		if c.proc.IsRunning() {
-			c.proc.Kill()
-		}
-	}
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.stopAppLocked()
 }
 
 func (c *Client) killApp() {
-	if c.proc != nil && c.proc.IsRunning() {
-		c.proc.Kill()
-		c.sendLog("client", "app killed")
-	}
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.killAppLocked()
 }
 
 func (c *Client) restartApp() {
-	c.stopApp()
-	c.startProc()
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+	c.stopAppLocked()
+	c.startProcLocked()
 }
 
 func (c *Client) handleExec(cmdStr string) {
@@ -265,13 +304,136 @@ func (c *Client) sendLog(source, line string) {
 }
 
 func (c *Client) Stop() {
-	c.stopApp()
-	if c.conn != nil {
-		c.conn.Close()
-	}
 	select {
 	case <-c.done:
 	default:
 		close(c.done)
 	}
+	c.stopApp()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
+func (c *Client) stopAppLocked() {
+	c.mu.Lock()
+	c.restartQueued = false
+	c.suppressRestart = true
+	proc := c.proc
+	c.mu.Unlock()
+
+	if proc == nil || !proc.IsRunning() {
+		return
+	}
+
+	c.sendLog("client", "stopping app...")
+	proc.Stop()
+	if proc.WaitTimeout(stopTimeout) {
+		return
+	}
+	proc.Kill()
+	proc.WaitTimeout(killTimeout)
+}
+
+func (c *Client) killAppLocked() {
+	c.mu.Lock()
+	c.restartQueued = false
+	c.suppressRestart = true
+	proc := c.proc
+	c.mu.Unlock()
+
+	if proc == nil || !proc.IsRunning() {
+		return
+	}
+
+	proc.Kill()
+	proc.WaitTimeout(killTimeout)
+	c.sendLog("client", "app killed")
+}
+
+func (c *Client) currentBinary() *protocol.BinaryPayload {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.lastBin == nil {
+		return nil
+	}
+
+	payload := *c.lastBin
+	return &payload
+}
+
+func (c *Client) handleProcExit(proc *process.Manager, state *os.ProcessState) {
+	c.mu.Lock()
+	if c.proc == proc {
+		c.proc = nil
+	}
+
+	expected := c.suppressRestart
+	c.suppressRestart = false
+	shouldRestart := !expected && !c.restartQueued && c.lastBin != nil && !c.isDone() && (state == nil || !state.Success())
+	if shouldRestart {
+		c.restartQueued = true
+	}
+	c.mu.Unlock()
+
+	if shouldRestart {
+		c.sendLog("client", fmt.Sprintf("app exited unexpectedly, restarting in %s", crashRestartDelay))
+		go c.restartAfterCrash()
+	}
+}
+
+func (c *Client) restartAfterCrash() {
+	select {
+	case <-c.done:
+		return
+	case <-time.After(crashRestartDelay):
+	}
+
+	c.procMu.Lock()
+	defer c.procMu.Unlock()
+
+	c.mu.Lock()
+	if !c.restartQueued || c.proc != nil || c.lastBin == nil || c.isDone() {
+		c.restartQueued = false
+		c.mu.Unlock()
+		return
+	}
+	c.restartQueued = false
+	c.mu.Unlock()
+
+	c.startProcLocked()
+}
+
+func (c *Client) retryFileBusy(action string, fn func() error) error {
+	var err error
+	for attempt := 0; attempt <= fileBusyRetryCount; attempt++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if !isFileBusy(err) || attempt == fileBusyRetryCount || c.isDone() {
+			return err
+		}
+		c.sendLog("client", fmt.Sprintf("%s busy, retrying in %s: %v", action, fileBusyRetryDelay, err))
+		time.Sleep(fileBusyRetryDelay)
+	}
+	return err
+}
+
+func (c *Client) isDone() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func isFileBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "text file busy") || strings.Contains(msg, "file busy") || strings.Contains(msg, "resource busy")
 }

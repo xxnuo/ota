@@ -7,24 +7,28 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 type Manager struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	binPath string
-	args    []string
-	workDir string
-	running bool
-	onLog   func(source, line string)
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	binPath  string
+	args     []string
+	workDir  string
+	running  bool
+	onLog    func(source, line string)
+	onExit   func(state *os.ProcessState)
+	waitDone chan struct{}
 }
 
-func New(binPath string, args []string, workDir string, onLog func(source, line string)) *Manager {
+func New(binPath string, args []string, workDir string, onLog func(source, line string), onExit func(state *os.ProcessState)) *Manager {
 	return &Manager{
 		binPath: binPath,
 		args:    args,
 		workDir: workDir,
 		onLog:   onLog,
+		onExit:  onExit,
 	}
 }
 
@@ -48,6 +52,7 @@ func (m *Manager) Start() error {
 		return err
 	}
 	m.running = true
+	m.waitDone = make(chan struct{})
 
 	go m.pipe("app:out", stdout)
 	go m.pipe("app:err", stderr)
@@ -68,18 +73,31 @@ func (m *Manager) pipe(source string, r io.ReadCloser) {
 }
 
 func (m *Manager) wait() {
+	var state *os.ProcessState
 	if m.cmd != nil && m.cmd.Process != nil {
-		state, _ := m.cmd.Process.Wait()
-		m.mu.Lock()
-		m.running = false
-		m.mu.Unlock()
-		if m.onLog != nil {
-			if state != nil {
-				m.onLog("client", fmt.Sprintf("app exited: %s", state.String()))
-			} else {
-				m.onLog("client", "app exited")
-			}
+		state, _ = m.cmd.Process.Wait()
+	}
+
+	m.mu.Lock()
+	m.running = false
+	done := m.waitDone
+	m.waitDone = nil
+	m.mu.Unlock()
+
+	if done != nil {
+		close(done)
+	}
+
+	if m.onLog != nil {
+		if state != nil {
+			m.onLog("client", fmt.Sprintf("app exited: %s", state.String()))
+		} else {
+			m.onLog("client", "app exited")
 		}
+	}
+
+	if m.onExit != nil {
+		m.onExit(state)
 	}
 }
 
@@ -92,7 +110,6 @@ func (m *Manager) Stop() {
 	}
 
 	stopProcess(m.cmd.Process)
-	m.running = false
 }
 
 func (m *Manager) Kill() {
@@ -104,7 +121,6 @@ func (m *Manager) Kill() {
 	}
 
 	killProcess(m.cmd.Process)
-	m.running = false
 }
 
 func (m *Manager) IsRunning() bool {
@@ -118,4 +134,25 @@ func (m *Manager) UpdateBin(binPath string, args []string) {
 	defer m.mu.Unlock()
 	m.binPath = binPath
 	m.args = args
+}
+
+func (m *Manager) WaitTimeout(timeout time.Duration) bool {
+	m.mu.Lock()
+	if !m.running {
+		m.mu.Unlock()
+		return true
+	}
+	done := m.waitDone
+	m.mu.Unlock()
+
+	if done == nil {
+		return true
+	}
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
