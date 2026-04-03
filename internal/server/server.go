@@ -95,16 +95,15 @@ func (s *Server) Serve() error {
 
 func (s *Server) Stop() {
 	s.mu.Lock()
+	clients := make([]*clientConn, 0, len(s.clients))
 	for _, c := range s.clients {
-		msg, _ := protocol.NewMsg(protocol.MsgDisconnect, nil)
-		c.mu.Lock()
-		c.conn.WriteMessage(websocket.TextMessage, msg)
-		c.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
-		c.conn.Close()
+		clients = append(clients, c)
 	}
 	s.clients = make(map[int]*clientConn)
 	s.mu.Unlock()
+	for _, c := range clients {
+		c.conn.Close()
+	}
 	close(s.done)
 }
 
