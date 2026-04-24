@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -35,6 +36,39 @@ func TestRetryFileBusy(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+}
+
+func TestWriteBinaryFileReplacesRunningFile(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "app.sh")
+	oldScript := []byte("#!/bin/sh\nwhile true; do sleep 1; done\n")
+	newScript := []byte("#!/bin/sh\necho updated\n")
+
+	if err := os.WriteFile(binPath, oldScript, 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	cmd := exec.Command(binPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start script: %v", err)
+	}
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	c := New("ws://127.0.0.1:1", dir, "")
+	if err := c.writeBinaryFile(binPath, newScript); err != nil {
+		t.Fatalf("replace binary: %v", err)
+	}
+
+	data, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read binary: %v", err)
+	}
+	if string(data) != string(newScript) {
+		t.Fatalf("expected replaced binary, got %q", string(data))
 	}
 }
 

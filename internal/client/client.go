@@ -168,9 +168,7 @@ func (c *Client) handleBinary(payload *protocol.BinaryPayload) {
 	c.stopAppLocked()
 
 	binPath := filepath.Join(c.workDir, payload.Filename)
-	if err := c.retryFileBusy("write binary", func() error {
-		return os.WriteFile(binPath, payload.Content, 0755)
-	}); err != nil {
+	if err := c.writeBinaryFile(binPath, payload.Content); err != nil {
 		c.sendLog("client", fmt.Sprintf("write binary error: %v", err))
 		return
 	}
@@ -403,6 +401,29 @@ func (c *Client) restartAfterCrash() {
 	c.mu.Unlock()
 
 	c.startProcLocked()
+}
+
+func (c *Client) writeBinaryFile(path string, content []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, path)
 }
 
 func (c *Client) retryFileBusy(action string, fn func() error) error {
