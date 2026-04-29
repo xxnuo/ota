@@ -165,10 +165,15 @@ func (c *Client) handleBinary(payload *protocol.BinaryPayload) {
 	c.procMu.Lock()
 	defer c.procMu.Unlock()
 
-	c.stopAppLocked()
+	if !c.stopAppLocked() {
+		c.sendLog("client", "stop app timeout")
+		return
+	}
 
 	binPath := filepath.Join(c.workDir, payload.Filename)
-	if err := c.writeBinaryFile(binPath, payload.Content); err != nil {
+	if err := c.retryFileBusy("write binary", func() error {
+		return c.writeBinaryFile(binPath, payload.Content)
+	}); err != nil {
 		c.sendLog("client", fmt.Sprintf("write binary error: %v", err))
 		return
 	}
@@ -245,7 +250,10 @@ func (c *Client) killApp() {
 func (c *Client) restartApp() {
 	c.procMu.Lock()
 	defer c.procMu.Unlock()
-	c.stopAppLocked()
+	if !c.stopAppLocked() {
+		c.sendLog("client", "stop app timeout")
+		return
+	}
 	c.startProcLocked()
 }
 
@@ -313,7 +321,7 @@ func (c *Client) Stop() {
 	}
 }
 
-func (c *Client) stopAppLocked() {
+func (c *Client) stopAppLocked() bool {
 	c.mu.Lock()
 	c.restartQueued = false
 	c.suppressRestart = true
@@ -321,16 +329,16 @@ func (c *Client) stopAppLocked() {
 	c.mu.Unlock()
 
 	if proc == nil || !proc.IsRunning() {
-		return
+		return true
 	}
 
 	c.sendLog("client", "stopping app...")
 	proc.Stop()
 	if proc.WaitTimeout(stopTimeout) {
-		return
+		return true
 	}
 	proc.Kill()
-	proc.WaitTimeout(killTimeout)
+	return proc.WaitTimeout(killTimeout)
 }
 
 func (c *Client) killAppLocked() {

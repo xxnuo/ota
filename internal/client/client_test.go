@@ -72,6 +72,44 @@ func TestWriteBinaryFileReplacesRunningFile(t *testing.T) {
 	}
 }
 
+func TestHandleBinaryWaitsForProcessExitBeforeReplace(t *testing.T) {
+	oldStopTimeout := stopTimeout
+	stopTimeout = 50 * time.Millisecond
+	defer func() {
+		stopTimeout = oldStopTimeout
+	}()
+
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "app.sh")
+	script := []byte("#!/bin/sh\ntrap 'sleep 0.2; exit 0' TERM\nwhile true; do sleep 1; done\n")
+	next := []byte("#!/bin/sh\necho updated\n")
+
+	if err := os.WriteFile(binPath, script, 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	c := New("ws://127.0.0.1:1", dir, "")
+	c.mu.Lock()
+	c.lastBin = &protocol.BinaryPayload{Filename: filepath.Base(binPath)}
+	c.mu.Unlock()
+
+	c.startProc()
+	defer c.Stop()
+
+	c.handleBinary(&protocol.BinaryPayload{
+		Filename: filepath.Base(binPath),
+		Content:  next,
+	})
+
+	data, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read binary: %v", err)
+	}
+	if string(data) != string(next) {
+		t.Fatalf("expected replaced binary, got %q", string(data))
+	}
+}
+
 func TestRestartAfterUnexpectedExit(t *testing.T) {
 	oldDelay := crashRestartDelay
 	crashRestartDelay = 50 * time.Millisecond
